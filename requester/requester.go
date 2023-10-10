@@ -26,8 +26,13 @@ import (
 	"os"
 	"sync"
 	"time"
+	"fmt"
+       "strconv"
+       "strings"
+       "math/rand"
 
 	"golang.org/x/net/http2"
+    "encoding/json"
 )
 
 // Max size of the buffer of result channel.
@@ -45,6 +50,7 @@ type result struct {
 	resDuration   time.Duration // response "read" duration
 	delayDuration time.Duration // delay between response and request
 	contentLength int64
+	id            string
 }
 
 type Work struct {
@@ -52,6 +58,9 @@ type Work struct {
 	Request *http.Request
 
 	RequestBody []byte
+
+	ReqBodyLines [] string
+    QueryLines [] string
 
 	// RequestFunc is a function to generate requests. If it is nil, then
 	// Request and RequestData are cloned for each request.
@@ -85,6 +94,8 @@ type Work struct {
 	// output will be dumped as a csv stream.
 	Output string
 
+        Input   string
+        inputData       []string
 	// ProxyAddr is the address of HTTP proxy server in the format on "host:port".
 	// Optional.
 	ProxyAddr *url.URL
@@ -98,12 +109,23 @@ type Work struct {
 	start    time.Duration
 
 	report *report
+    
+    opFile *os.File
+    m *sync.Mutex 
 }
+
 
 func (b *Work) writer() io.Writer {
 	if b.Writer == nil {
 		return os.Stdout
 	}
+	if len(b.Input) > 0 {
+               dat, err := ioutil.ReadFile(b.Input)
+               if err != nil {
+                       panic(err)
+               }
+               b.inputData = strings.Split(string(dat),"\n")
+       }
 	return b.Writer
 }
 
@@ -144,17 +166,79 @@ func (b *Work) Finish() {
 	b.report.finalize(total)
 }
 
-func (b *Work) makeRequest(c *http.Client) {
+func (b *Work) makeRequest(c *http.Client,workerId int, n2 int, nPerWorker int) {
 	s := now()
 	var size int64
 	var code int
 	var dnsStart, connStart, resStart, reqStart, delayStart time.Duration
 	var dnsDuration, connDuration, resDuration, reqDuration, delayDuration time.Duration
 	var req *http.Request
+	var id string
+    var Extra string
+
+       Extra=""
+       id=strconv.Itoa(workerId)+","+strconv.Itoa(n2)+","
+       var rIndex int
+       if len(b.inputData) > 0 {
+               rIndex=rand.Intn(len(b.inputData)-1)
+               Extra=b.inputData[rIndex]
+               id=id+Extra+","
+       }
 	if b.RequestFunc != nil {
 		req = b.RequestFunc()
 	} else {
-		req = cloneRequest(b.Request, b.RequestBody)
+
+		// if len(b.ReqBodyLines) > 0 {
+  //   		//var reqBody []byte
+  //   		var reqBodyIdx = workerId * nPerWorker + n2 
+  //   		var reqBody = []byte(b.ReqBodyLines[reqBodyIdx])
+  //   		req = cloneRequest(b.Request, reqBody,workerId,n2,b.Output,Extra)
+		// } else {
+
+  //           req = cloneRequest(b.Request, b.RequestBody,workerId,n2,b.Output,Extra)
+  //      	}
+        var reqBody []byte = b.RequestBody
+        var queryObj map[string]interface{}
+
+        if len(b.ReqBodyLines) > 0 {
+            //var reqBody []byte
+            var reqBodyIdx = workerId * nPerWorker + n2 
+            fmt.Printf("\nreqBodyIdx = %d, wid = %d, nPerWorker = %d, n2 = %d", reqBodyIdx, workerId, nPerWorker, n2);
+            reqBody = []byte(b.ReqBodyLines[reqBodyIdx])
+        }
+
+        req = cloneRequest(b.Request, reqBody,workerId,n2,b.Output,Extra)
+        
+        var reqIdx = workerId * nPerWorker + n2 
+        if len(b.QueryLines) > reqIdx {
+        
+            var queryObjStr = []byte(b.QueryLines[reqIdx]);
+            err := json.Unmarshal(queryObjStr, &queryObj)
+            if err != nil {
+                fmt.Println("error in parsing query params list:", err)
+            } else {
+                var q = url.Values{}
+                for key, value := range queryObj {
+                    
+                    if s, ok := value.(string); ok {
+                        // s is string here
+                        q.Add(key, s)
+                    } else if v, ok := value.(float64); ok {
+                        //v is int32 here
+                        strV := fmt.Sprintf("%f", v) 
+                        q.Add(key, strV)
+                    }                     
+                    
+                    
+                }
+                req.URL.RawQuery = q.Encode()
+            }            
+
+        }
+
+
+
+
 	}
 	trace := &httptrace.ClientTrace{
 		DNSStart: func(info httptrace.DNSStartInfo) {
@@ -175,6 +259,7 @@ func (b *Work) makeRequest(c *http.Client) {
 		WroteRequest: func(w httptrace.WroteRequestInfo) {
 			reqDuration = now() - reqStart
 			delayStart = now()
+			id = id + time.Now().String()
 		},
 		GotFirstResponseByte: func() {
 			delayDuration = now() - delayStart
@@ -186,7 +271,13 @@ func (b *Work) makeRequest(c *http.Client) {
 	if err == nil {
 		size = resp.ContentLength
 		code = resp.StatusCode
-		io.Copy(ioutil.Discard, resp.Body)
+        
+        b.m.Lock() 
+            io.Copy(b.opFile, resp.Body)
+            b.opFile.WriteString("\n")
+        b.m.Unlock()
+        
+		//io.Copy(ioutil.Discard, resp.Body)
 		resp.Body.Close()
 	}
 	t := now()
@@ -203,10 +294,11 @@ func (b *Work) makeRequest(c *http.Client) {
 		reqDuration:   reqDuration,
 		resDuration:   resDuration,
 		delayDuration: delayDuration,
+		id: id,
 	}
 }
 
-func (b *Work) runWorker(client *http.Client, n int) {
+func (b *Work) runWorker(client *http.Client, n int, id int, nPerWorker int) {
 	var throttle <-chan time.Time
 	if b.QPS > 0 {
 		throttle = time.Tick(time.Duration(1e6/(b.QPS)) * time.Microsecond)
@@ -226,7 +318,7 @@ func (b *Work) runWorker(client *http.Client, n int) {
 			if b.QPS > 0 {
 				<-throttle
 			}
-			b.makeRequest(client)
+			b.makeRequest(client,id,i, n)
 		}
 	}
 }
@@ -253,18 +345,31 @@ func (b *Work) runWorkers() {
 	client := &http.Client{Transport: tr, Timeout: time.Duration(b.Timeout) * time.Second}
 
 	// Ignore the case where b.N % b.C != 0.
+
+    //open an output file where we record the response body
+    
+    opFile, err := os.Create("./op.txt")
+    if err != nil {
+        panic(err)
+    }
+    b.opFile = opFile    
+    defer b.opFile.Close()
+
+    var mut sync.Mutex
+    b.m = &mut;
+
 	for i := 0; i < b.C; i++ {
-		go func() {
-			b.runWorker(client, b.N/b.C)
+		go func(n int) {
+			b.runWorker(client, b.N/b.C,n, b.C)
 			wg.Done()
-		}()
+		}(i)
 	}
 	wg.Wait()
 }
 
 // cloneRequest returns a clone of the provided *http.Request.
 // The clone is a shallow copy of the struct and its Header map.
-func cloneRequest(r *http.Request, body []byte) *http.Request {
+func cloneRequest(r *http.Request, body []byte, n int,n2 int, Output string,Extra string) *http.Request {
 	// shallow copy of the struct
 	r2 := new(http.Request)
 	*r2 = *r
@@ -276,7 +381,64 @@ func cloneRequest(r *http.Request, body []byte) *http.Request {
 	if len(body) > 0 {
 		r2.Body = ioutil.NopCloser(bytes.NewReader(body))
 	}
+
+       if Output == "csv" {
+               var appender string
+               if strings.Contains(r.URL.String(), "?") {
+                       appender = "&"
+               } else {
+                       appender = "?"
+               }
+               var newURL =r.URL.String()+appender+"conn="+strconv.Itoa(n)+"&cr="+strconv.Itoa(n2)+"&"+Extra
+               r2,err := http.NewRequest(r.Method,newURL,nil)
+               if err != nil {
+                       fmt.Println("error")
+               }
+               // deep copy of the Header
+               r2.Header = make(http.Header, len(r.Header))
+               for k, s := range r.Header {
+                       r2.Header[k] = append([]string(nil), s...)
+               }
+               if len(body) > 0 {
+                       r2.Body = ioutil.NopCloser(bytes.NewReader(body))
+                       r2.ContentLength = int64(len(body))
+               }
+               return r2
+       } else {
+               if len(Extra) > 0 {
+                       var appender string
+                       if strings.Contains(r.URL.String(), "?") {
+                               appender = "&"
+                       } else {
+                               appender = "?"
+                       }
+                       var newURL =r.URL.String()+appender+Extra
+                       r2,err := http.NewRequest(r.Method,newURL,nil)
+                       if err != nil {
+                               fmt.Println("error")
+                       }
+                       // deep copy of the Header
+                       r2.Header = make(http.Header, len(r.Header))
+                       for k, s := range r.Header {
+                               r2.Header[k] = append([]string(nil), s...)
+                       }
+                       if len(body) > 0 {
+                               r2.Body = ioutil.NopCloser(bytes.NewReader(body))
+                       }
+                       return r2
+               }
+               r2 := new(http.Request)
+               *r2 = *r
+               // deep copy of the Header
+               r2.Header = make(http.Header, len(r.Header))
+               for k, s := range r.Header {
+                       r2.Header[k] = append([]string(nil), s...)
+               }
+               if len(body) > 0 {
+                       r2.Body = ioutil.NopCloser(bytes.NewReader(body))
+               }
 	return r2
+	}
 }
 
 func min(a, b int) int {
