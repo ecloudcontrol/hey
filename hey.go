@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/rakyll/hey/requester"
+	// "../requester/requester"
 )
 
 const (
@@ -43,6 +44,8 @@ var (
 	headers     = flag.String("h", "", "")
 	body        = flag.String("d", "", "")
 	bodyFile    = flag.String("D", "", "")
+	perReqBody  = flag.String("P", "", "")
+	perReqQuery  = flag.String("Q", "", "")
 	accept      = flag.String("A", "", "")
 	contentType = flag.String("T", "text/html", "")
 	authHeader  = flag.String("a", "", "")
@@ -50,6 +53,7 @@ var (
 	userAgent   = flag.String("U", "", "")
 
 	output = flag.String("o", "", "")
+	input = flag.String("i", "", "")
 
 	c = flag.Int("c", 50, "")
 	n = flag.Int("n", 200, "")
@@ -80,6 +84,8 @@ Options:
       "csv" is the only supported alternative. Dumps the response
       metrics in comma-separated values format.
 
+  -P  Per request Body Input File.
+  -Q  Per request Query string input file (should be a json file as key: value)
   -m  HTTP method, one of GET, POST, PUT, DELETE, HEAD, OPTIONS.
   -H  Custom HTTP header. You can specify as many as needed by repeating the flag.
       For example, -H "Accept: text/html" -H "Content-Type: application/xml" .
@@ -107,6 +113,8 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, fmt.Sprintf(usage, runtime.NumCPU()))
 	}
+
+
 
 	var hs headerSlice
 	flag.Var(&hs, "H", "")
@@ -182,6 +190,31 @@ func main() {
 		bodyAll = slurp
 	}
 
+	//if perReqBody exists, it would override the body file
+	// Each request body would be taken from one line of the input file
+	var reqBodyLines [] string
+	var queryLines [] string
+
+	if *perReqBody != "" {
+		allFile, err := ioutil.ReadFile(*perReqBody)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+		reqBodyLines = strings.Split(string(allFile),"\n")
+		//fmt.Fprintf(os.Stderr, reqBodyLines[0]);
+	}
+
+	if *perReqQuery != "" {
+		allFile, err := ioutil.ReadFile(*perReqQuery)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+		queryLines = strings.Split(string(allFile),"\n")
+		//fmt.Fprintf(os.Stderr, queryLines[0]);
+	}
+
+
+
 	var proxyURL *gourl.URL
 	if *proxyAddr != "" {
 		var err error
@@ -192,6 +225,11 @@ func main() {
 	}
 
 	req, err := http.NewRequest(method, url, nil)
+	// values := req.URL.Query()
+	// fmt.Println("\nHost name: ", req.URL.Hostname())
+	// for key, val := range values {
+ //        fmt.Println("Key:", key, "=>", "Value:", val)
+ //  }
 	if err != nil {
 		usageAndExit(err.Error())
 	}
@@ -224,6 +262,8 @@ func main() {
 	w := &requester.Work{
 		Request:            req,
 		RequestBody:        bodyAll,
+		ReqBodyLines:       reqBodyLines,
+		QueryLines:         queryLines,
 		N:                  num,
 		C:                  conc,
 		QPS:                q,
@@ -234,6 +274,7 @@ func main() {
 		H2:                 *h2,
 		ProxyAddr:          proxyURL,
 		Output:             *output,
+		Input:             *input,
 	}
 	w.Init()
 
